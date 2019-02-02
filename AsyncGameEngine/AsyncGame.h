@@ -290,7 +290,7 @@ public:
 		buff += bytes;
 
 		for (auto& c : cb.commands) {
-			unsigned int len = c.command.length();
+			unsigned int len = (unsigned int)c.command.length();
 			*(unsigned int*)buff = len;
 			bytes += sizeof(unsigned int);
 			buff += sizeof(unsigned int);
