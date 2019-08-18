@@ -59,6 +59,10 @@ public:
 	Message(byte *d) : data(d) {
 
 	}
+
+	void SetDataLen(ushort len) {
+		header.len = sizeof(header) + len;
+	}
 };
 
 class MessageBlock {
@@ -70,10 +74,21 @@ private:
 
 public:
 
+	MessageBlock() {
+		header.sender_id = GetCurrentProcessId();
+	}
+
 	Message get(uint &pos) {
+		if (pos + sizeof(MessageBlockHeader) >= header.len) {
+			Message m(NULL);
+			m.header.len = 0;
+			m.header.type = 0;
+			return m;
+		}
 		assert(pos + sizeof(MessageBlockHeader) < header.len);
 		Message m(data + pos + sizeof(MessageHeader));
 		m.header = *(MessageHeader*)(data + pos);
+		pos += m.header.len;
 		return m;
 	}
 
@@ -89,6 +104,23 @@ public:
 		return m;
 	}
 
+};
+
+class MessageQueue;
+class MessageQueueIterator;
+
+class MessageQueueContainer {
+	uint* qcursor;
+	MessageQueue* messagequeue;
+
+public:
+	MessageQueueContainer(MessageQueue *mq, uint& pos) {
+		qcursor = &pos;
+		messagequeue = mq;
+	}
+
+	MessageQueueIterator begin();
+	MessageQueueIterator end();
 };
 
 class MessageQueue {
@@ -148,7 +180,7 @@ public:
 		const auto old_end = _ReserveSpace(block.len);
 		
 		memcpy(data + old_end, &block, sizeof(block));
-		memcpy(data + old_end + sizeof(block), mdata, block.len);
+		memcpy(data + old_end + sizeof(block), mdata, block.len-sizeof(block));
 		MessageBlockHeader* written_block = (MessageBlockHeader*)(data + old_end);
 		written_block->read_count.store(1, std::memory_order::memory_order_release);
 	}
@@ -168,9 +200,84 @@ public:
 		if (read_count == 0)
 			return NULL;//read_count of 0 means the message is still being written
 		pos = (pos + block->header.len) % MESSAGE_QUEUE_LEN;
+
+		if (block->header.sender_id == GetCurrentProcessId())
+			return NULL;
+
 		return block;
 	}
+
+	void Cleanup() {
+		//cleanup any message blocks where read_count == num_listeners
+		//subtract total message block lengths out of len_end.a with a compare exchange all at once
+		//	-this would mean only one process can be in charge of running Cleanup, alternatively I would have to do it one block at a time
+	}
+
+	MessageQueueContainer EachMessage(uint& pos) {
+		return MessageQueueContainer(this, pos);
+	}
 };
+
+class MessageQueueIterator {
+	uint* qcursor;
+	uint mcursor;
+	MessageQueue* messagequeue;
+	MessageBlock* mb;//I should change this to a ref class so it can mark it as read in the destructor
+	Message m;
+
+public:
+	MessageQueueIterator(MessageQueue* mq, uint* pos) : m(NULL) {
+		qcursor = pos;
+		messagequeue = mq;
+		mb = NULL;
+		mcursor = 0;
+		if (qcursor == NULL || messagequeue == NULL)
+			return;
+
+		mb = messagequeue->GetBlock(*qcursor);
+		if (mb == NULL) {
+			qcursor = NULL;
+			return;
+		}
+
+		m = mb->get(mcursor);
+		if (m.data == NULL)
+			qcursor = NULL;
+	}
+
+	Message operator*() {
+		return m;
+	}
+
+	void operator++() {
+		m = mb->get(mcursor);
+		if (m.data != NULL)
+			return;
+		mcursor = 0;
+		mb->header.read_count.fetch_add(1, std::memory_order::memory_order_relaxed);
+		mb = messagequeue->GetBlock(*qcursor);
+		if (mb == NULL) {
+			qcursor = NULL;
+			return;
+		}
+
+		m = mb->get(mcursor);
+		if (m.data == NULL)
+			qcursor = NULL;
+	}
+
+	bool operator!=(MessageQueueIterator t) {
+		return qcursor != t.qcursor;
+	}
+};
+
+MessageQueueIterator MessageQueueContainer::begin() {
+	return MessageQueueIterator(messagequeue, qcursor);
+}
+
+MessageQueueIterator MessageQueueContainer::end() {
+	return MessageQueueIterator(NULL, NULL);
+}
 
 class SharedMem {
 	static void* MapFile(HANDLE hMapFile, int BUF_SIZE)
@@ -338,8 +445,35 @@ std::unordered_map<std::string, std::string> ParseKeyValues(std::string text) {
 	return map;
 }
 
+std::string WriteKeyValues(std::unordered_map<std::string, std::string>& map) {
+	std::string s;
+	for (auto& i : map) {
+		s += i.first + "=" + i.second + "\n";
+	}
+	return s;
+}
+
+MessageQueue* CreateSharedMessageQueue(SharedMem &sm, std::string name) {
+	uint shared_mem_id = GetCurrentProcessId();
+	char buff[64];
+	sprintf_s(buff, "%u", shared_mem_id);
+	name = name + "-" + buff;
+	void* d = sm.CreateSharedMemory(name, sizeof(MessageQueue));
+	return new (d) MessageQueue();
+}
+
+MessageQueue* OpenSharedMessageQueue(SharedMem& sm, std::string name, uint shared_mem_id) {
+	char buff[64];
+	sprintf_s(buff, "%u", shared_mem_id);
+	name = name + "-" + buff;
+	void* d = sm.OpenSharedMemory(name, sizeof(MessageQueue));
+	return (MessageQueue*)d;
+}
+
 void run_lib_tests() {
 	auto map = ParseKeyValues("foo=bar\n#test comment\nsigma=nuts");
+	std::string smap = WriteKeyValues(map);
+	map = ParseKeyValues(smap);
 	assert(map.size() == 2);
 	assert(map["foo"] == "bar");
 	assert(map["sigma"] == "nuts");
@@ -350,13 +484,13 @@ void run_lib_tests() {
 	assert(sizeof(t2) == sizeof(Uint32Pair));
 
 	SharedMem sm;
-	void* d = sm.CreateSharedMemory("foobar", sizeof(MessageQueue));
-	MessageQueue& mq = *new (d) MessageQueue();
+	MessageQueue& mq = *CreateSharedMessageQueue(sm, "foobar");
 
 	MessageBlock mb;
+	mb.header.sender_id = 0;//we can't receive a message that we sent
 	auto m = mb.reserve();
 	strcpy_s((char*)m.data, 1024, "foobar");
-	m.header.len = strlen((char*)m.data) + sizeof(m.header);
+	m.SetDataLen((ushort)strlen((char*)m.data)+1);
 	mb.push(m);
 
 	mq.SendMessageBlock(mb.header, mb.data);
@@ -367,4 +501,6 @@ void run_lib_tests() {
 	m = recv_mb.get(cursor);
 	assert(strcmp((char*)m.data, "foobar") == 0);
 	std::cout << "got: " << (char*)m.data << "\n";
+
+	std::cout << "\ntests completed\n\n";
 }
