@@ -10,9 +10,16 @@
 #include <string>
 #include <unordered_map>
 
+typedef unsigned __int64 uint64;
 typedef unsigned int uint;
 typedef unsigned short ushort;
 const uint MESSAGE_QUEUE_LEN = 1 * 1024 * 1024;//we'll need to handle this being set by the caller, for compatibility with different versions
+
+
+struct alignas(8) Uint32Pair {
+	uint a;
+	uint b;
+};
 
 std::vector<wchar_t> CharToWChar(std::string &s)
 {
@@ -29,6 +36,8 @@ struct MessageBlockHeader {
 	uint sender_id;
 
 	MessageBlockHeader() : read_count(0) {
+		len = sizeof(MessageBlockHeader);
+		sender_id = 0;
 	}
 };
 
@@ -37,7 +46,8 @@ struct MessageHeader {
 	ushort len;
 
 	MessageHeader() {
-
+		type = 0;
+		len = 0;
 	}
 };
 
@@ -54,22 +64,31 @@ public:
 class MessageBlock {
 public:
 	MessageBlockHeader header;
+	byte data[64 * 1024];
 private:
-	byte data[MESSAGE_QUEUE_LEN];
 	//ushort start;
 
 public:
 
 	Message get(uint &pos) {
-		assert(pos < header.len);
+		assert(pos + sizeof(MessageBlockHeader) < header.len);
 		Message m(data + pos + sizeof(MessageHeader));
 		m.header = *(MessageHeader*)(data + pos);
 		return m;
 	}
 
 	void push(Message m) {
-
+		MessageHeader &inplace = *(MessageHeader*)(data + header.len - sizeof(MessageBlockHeader));
+		inplace = m.header;
+		assert(m.data == data + header.len + sizeof(MessageHeader) - sizeof(MessageBlockHeader));
+		header.len += m.header.len;
 	}
+
+	Message reserve() {
+		Message m(data + header.len + sizeof(MessageHeader) - sizeof(MessageBlockHeader));
+		return m;
+	}
+
 };
 
 class MessageQueue {
@@ -77,26 +96,59 @@ class MessageQueue {
 	//the hub module would just reset end to 0 when appropriate? but that means readers will need to check both if the next spot is a new message and if the start is a new message
 
 	//uint protocol_version;?
-	std::atomic<uint> end;
+	//std::atomic<uint> end;
+	//std::atomic<uint> start;
+	std::atomic<Uint32Pair> len_end;
 	byte data[MESSAGE_QUEUE_LEN * 2];//double length so we don't need to strictly wrap based on the length of the MessageBlock being added, we just wrap by the start point
 
+	uint _ReserveSpace(uint len) {
+		auto old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
+		auto new_len_end = old_len_end;
+
+		do {
+			new_len_end = old_len_end;
+			new_len_end.a += len;
+			new_len_end.b = (new_len_end.b + len) % MESSAGE_QUEUE_LEN;
+		} while (!len_end.compare_exchange_weak(old_len_end, new_len_end));
+
+		while (len_end.load(std::memory_order::memory_order_relaxed).a > MESSAGE_QUEUE_LEN) {
+			std::cout << "message queue is full! waiting...\n";
+		}
+
+		return old_len_end.b;
+	}
+
+	bool _IsInRange(uint pos) {
+		assert(pos < MESSAGE_QUEUE_LEN);
+		auto old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
+		uint len = old_len_end.a;
+		uint end = old_len_end.b;
+		uint start = (end - len) % MESSAGE_QUEUE_LEN;
+		bool is_after_start = int(pos) >= int(end) - int(len);//treat the wrap of the circular buffer as a negative number
+		bool is_before_end = pos < start + len;//check the end position without modulus
+		return is_after_start && is_before_end;
+	}
+
 public:
-	MessageQueue() : end(0) {
-		assert(end.is_lock_free());
+	MessageQueue() {
+		assert(len_end.is_lock_free());
+		auto t = len_end.load();
+		t.a = 0;
+		t.b = 0;
+		len_end = t;
 		MessageBlockHeader mb;
 		assert(mb.read_count.is_lock_free());
 		memset(data, 0, sizeof(data));
 	}
 
-	void SendMessageBlock(MessageBlockHeader block, byte* data)
+	void SendMessageBlock(MessageBlockHeader &block, byte* mdata)
 	{
 		//assert the lengths add up
 		//assert the types of the messages are recognized?
-		//need to check if the queue has room, and wait until it does
-		uint old_end = end.fetch_add(block.len, std::memory_order::memory_order_release);
-		old_end %= MESSAGE_QUEUE_LEN;
+		const auto old_end = _ReserveSpace(block.len);
+		
 		memcpy(data + old_end, &block, sizeof(block));
-		memcpy(data + old_end + sizeof(block), data, block.len);
+		memcpy(data + old_end + sizeof(block), mdata, block.len);
 		MessageBlockHeader* written_block = (MessageBlockHeader*)(data + old_end);
 		written_block->read_count.store(1, std::memory_order::memory_order_release);
 	}
@@ -107,10 +159,14 @@ public:
 		//pretty sure incrementing the atomic read_count will invalidate that whole cache line for every other cache
 		//maybe a future optimization could be have a separate array for read_counts to keep them in a different cache line from the data
 		//I should benchmark all the options with many processes doing pings
-		assert(pos < MESSAGE_QUEUE_LEN);
+		
+		if (!_IsInRange(pos))
+			return NULL;
+
 		MessageBlock* block = (MessageBlock*)(data + pos);
-		ushort read_count = block->header.read_count;
-		if (read_count == 0) return NULL;
+		ushort read_count = block->header.read_count.load(std::memory_order::memory_order_relaxed);
+		if (read_count == 0)
+			return NULL;//read_count of 0 means the message is still being written
 		pos = (pos + block->header.len) % MESSAGE_QUEUE_LEN;
 		return block;
 	}
@@ -184,6 +240,16 @@ public:
 
 		std::cout << "shared memory " << path << " opened!\n";
 		return pBuf;
+	}
+
+	void* CreateSharedMemory(std::string path, uint BUF_SIZE)
+	{
+		return CreateSharedMemory(path, hMap, pBuf, BUF_SIZE);
+	}
+
+	void* OpenSharedMemory(std::string path, uint BUF_SIZE)
+	{
+		return OpenSharedMemory(path, hMap, pBuf, BUF_SIZE);
 	}
 
 	~SharedMem()
@@ -278,5 +344,27 @@ void run_lib_tests() {
 	assert(map["foo"] == "bar");
 	assert(map["sigma"] == "nuts");
 
-	MessageQueue mq;
+	std::atomic<Uint32Pair> t2;
+	assert(t2.is_lock_free());
+	assert(sizeof(Uint32Pair) == 8);
+	assert(sizeof(t2) == sizeof(Uint32Pair));
+
+	SharedMem sm;
+	void* d = sm.CreateSharedMemory("foobar", sizeof(MessageQueue));
+	MessageQueue& mq = *new (d) MessageQueue();
+
+	MessageBlock mb;
+	auto m = mb.reserve();
+	strcpy_s((char*)m.data, 1024, "foobar");
+	m.header.len = strlen((char*)m.data) + sizeof(m.header);
+	mb.push(m);
+
+	mq.SendMessageBlock(mb.header, mb.data);
+
+	uint cursor = 0;
+	auto& recv_mb = *mq.GetBlock(cursor);
+	cursor = 0;
+	m = recv_mb.get(cursor);
+	assert(strcmp((char*)m.data, "foobar") == 0);
+	std::cout << "got: " << (char*)m.data << "\n";
 }
