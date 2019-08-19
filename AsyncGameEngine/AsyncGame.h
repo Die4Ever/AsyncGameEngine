@@ -141,7 +141,7 @@ class MessageQueue {
 
 		while (old_len_end.a + len >= MESSAGE_QUEUE_LEN) {
 			std::cout << "message queue is full!\n";
-			Sleep(100);
+			Sleep(100);//make sure to reduce or remove this sleep timer for production code or a game
 			Cleanup();
 			old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
 		}
@@ -175,11 +175,10 @@ class MessageQueue {
 		return (is_after_start1 && is_before_end1) || (is_after_start2 && is_before_end2);
 	}
 
-
 	bool _IsInRange(uint &pos) {
 		auto old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
 		bool ret = _IsInRange(pos, old_len_end);
-		if (!ret && pos != _GetStart(old_len_end) && pos != old_len_end.b) {
+		if (!ret && pos != old_len_end.b) { //it can't be out of range if it's equal to the start, unless it's also equal to the end but we check for that anyways
 			pos = _GetStart(old_len_end);
 			return _IsInRange(pos, old_len_end);
 		}
@@ -189,6 +188,7 @@ class MessageQueue {
 public:
 	MessageQueue() {
 		assert(len_end.is_lock_free());
+		assert(listeners.is_lock_free());
 		auto t = len_end.load();
 		listeners = 0;
 		t.a = 0;
@@ -228,12 +228,8 @@ public:
 		//maybe a future optimization could be have a separate array for read_counts to keep them in a different cache line from the data
 		//I should benchmark all the options with many processes doing pings
 		
-		if (!_IsInRange(pos)) {
-			//pos = GetStart();//or maybe a variant of _IsInRange that does this too since it already loaded len_end?
-			//auto old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
-			//pos = old_len_end.b - old_len_end.a;
+		if (!_IsInRange(pos))
 			return NULL;
-		}
 
 		MessageBlock* block = (MessageBlock*)(data + pos);
 		ushort read_count = block->header.read_count.load(std::memory_order::memory_order_relaxed);
@@ -611,7 +607,6 @@ void run_lib_tests() {
 	std::cout << "\n\ntest to ensure the queue wraps properly...\n";
 	for (int i = 0; i < MESSAGE_QUEUE_LEN; i++) {//yea we're doing way more than 1 loop of the queue
 		mq.SendMessageBlock(mb.header, mb.data);//resend the message from sender_id 0, we want to read this
-
 		int loop_test = 0;
 		for (auto m : mq.EachMessage(cursor)) {
 			loop_test++;
