@@ -12,19 +12,13 @@ using namespace std;
 #include "AsyncGame.h"
 
 bool Proc(MessageQueue& mq) {
-	static uint cursor = 0;
-
+	static uint cursor = mq.GetStart();
+	
 	mq.Cleanup();
 
 	for (auto recvm : mq.EachMessage(cursor)) {
 		std::cout << "got: " << (char*)recvm.data << "\n";
 	}
-	/*auto recvm = mq.GetBlock(cursor);
-
-	if (recvm) {
-		uint i = 0;
-		std::cout << "got: " << (char*)recvm->get(i).data << "\n";
-	}*/
 
 	MessageBlock mb;
 
@@ -52,7 +46,7 @@ int main(int argc, char* argv[])
 	auto game = Module::SpawnModule("AsyncGame.exe");
 
 	while (Proc(mq)) {
-		//Sleep(1);
+		Sleep(300);
 	}
 
 	std::cout.sync_with_stdio();

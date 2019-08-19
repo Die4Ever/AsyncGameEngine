@@ -13,7 +13,8 @@
 typedef unsigned __int64 uint64;
 typedef unsigned int uint;
 typedef unsigned short ushort;
-const uint MESSAGE_QUEUE_LEN = 1 * 1024 * 1024;//we'll need to handle this being set by the caller, for compatibility with different versions
+const uint MESSAGE_QUEUE_LEN = 64 * 1024;//we'll need to handle this being set by the caller, for compatibility with different versions
+const uint MAX_MESSAGEBLOCK_SIZE = USHRT_MAX/2;//we use a ushort for the length variable, we could set this lower if we wanted, I just don't see a reason to
 
 
 struct alignas(8) Uint32Pair {
@@ -68,7 +69,7 @@ public:
 class MessageBlock {
 public:
 	MessageBlockHeader header;
-	byte data[64 * 1024];
+	byte data[MAX_MESSAGEBLOCK_SIZE];
 private:
 	//ushort start;
 
@@ -96,6 +97,7 @@ public:
 		MessageHeader &inplace = *(MessageHeader*)(data + header.len - sizeof(MessageBlockHeader));
 		inplace = m.header;
 		assert(m.data == data + header.len + sizeof(MessageHeader) - sizeof(MessageBlockHeader));
+		assert(int(header.len) + int(m.header.len) < MAX_MESSAGEBLOCK_SIZE);
 		header.len += m.header.len;
 	}
 
@@ -130,41 +132,65 @@ class MessageQueue {
 	//uint protocol_version;?
 	//std::atomic<uint> end;
 	//std::atomic<uint> start;
+	std::atomic<ushort> listeners;
 	std::atomic<Uint32Pair> len_end;
-	byte data[MESSAGE_QUEUE_LEN * 2];//double length so we don't need to strictly wrap based on the length of the MessageBlock being added, we just wrap by the start point
+	byte data[MESSAGE_QUEUE_LEN + MAX_MESSAGEBLOCK_SIZE];//extra length so we don't need to strictly wrap based on the length of the MessageBlock being added, we just wrap by the start point
 
 	uint _ReserveSpace(uint len) {
 		auto old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
+
+		while (old_len_end.a + len >= MESSAGE_QUEUE_LEN) {
+			std::cout << "message queue is full!\n";
+			Sleep(100);
+			Cleanup();
+			old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
+		}
+
 		auto new_len_end = old_len_end;
 
 		do {
-			new_len_end = old_len_end;
-			new_len_end.a += len;
-			new_len_end.b = (new_len_end.b + len) % MESSAGE_QUEUE_LEN;
+			new_len_end.a = old_len_end.a + len;
+			new_len_end.b = (old_len_end.b + len) % MESSAGE_QUEUE_LEN;
 		} while (!len_end.compare_exchange_weak(old_len_end, new_len_end));
-
-		while (len_end.load(std::memory_order::memory_order_relaxed).a > MESSAGE_QUEUE_LEN) {
-			std::cout << "message queue is full! waiting...\n";
-		}
 
 		return old_len_end.b;
 	}
 
-	bool _IsInRange(uint pos) {
-		assert(pos < MESSAGE_QUEUE_LEN);
-		auto old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
+	uint _GetStart(Uint32Pair old_len_end) {
 		uint len = old_len_end.a;
 		uint end = old_len_end.b;
 		uint start = (end - len) % MESSAGE_QUEUE_LEN;
-		bool is_after_start = int(pos) >= int(end) - int(len);//treat the wrap of the circular buffer as a negative number
-		bool is_before_end = pos < start + len;//check the end position without modulus
-		return is_after_start && is_before_end;
+		return start;
+	}
+
+	bool _IsInRange(uint pos, Uint32Pair old_len_end) {
+		assert(pos < MESSAGE_QUEUE_LEN);
+		uint len = old_len_end.a;
+		uint end = old_len_end.b;
+		uint start = _GetStart(old_len_end);
+		bool is_after_start1 = int(pos) >= int(end) - int(len);//treat the wrap of the circular buffer as a negative number
+		bool is_before_end1 = pos < end;
+		bool is_after_start2 = pos >= start;
+		bool is_before_end2 = pos < start + len;
+		return (is_after_start1 && is_before_end1) || (is_after_start2 && is_before_end2);
+	}
+
+
+	bool _IsInRange(uint &pos) {
+		auto old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
+		bool ret = _IsInRange(pos, old_len_end);
+		if (!ret && pos != _GetStart(old_len_end) && pos != old_len_end.b) {
+			pos = _GetStart(old_len_end);
+			return _IsInRange(pos, old_len_end);
+		}
+		return ret;
 	}
 
 public:
 	MessageQueue() {
 		assert(len_end.is_lock_free());
 		auto t = len_end.load();
+		listeners = 0;
 		t.a = 0;
 		t.b = 0;
 		len_end = t;
@@ -173,9 +199,19 @@ public:
 		memset(data, 0, sizeof(data));
 	}
 
+	uint GetStart() {
+		auto old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
+		return _GetStart(old_len_end);
+	}
+
+	void AddListener() {
+		listeners.fetch_add(1, std::memory_order::memory_order_relaxed);
+	}
+
 	void SendMessageBlock(MessageBlockHeader &block, byte* mdata)
 	{
 		//assert the lengths add up
+		assert(block.len > sizeof(block));
 		//assert the types of the messages are recognized?
 		const auto old_end = _ReserveSpace(block.len);
 		
@@ -192,17 +228,24 @@ public:
 		//maybe a future optimization could be have a separate array for read_counts to keep them in a different cache line from the data
 		//I should benchmark all the options with many processes doing pings
 		
-		if (!_IsInRange(pos))
+		if (!_IsInRange(pos)) {
+			//pos = GetStart();//or maybe a variant of _IsInRange that does this too since it already loaded len_end?
+			//auto old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
+			//pos = old_len_end.b - old_len_end.a;
 			return NULL;
+		}
 
 		MessageBlock* block = (MessageBlock*)(data + pos);
 		ushort read_count = block->header.read_count.load(std::memory_order::memory_order_relaxed);
-		if (read_count == 0)
+		if (read_count == 0) {
+			//std::cout << "read_count == 0, message still being written?\n";
 			return NULL;//read_count of 0 means the message is still being written
+		}
 		pos = (pos + block->header.len) % MESSAGE_QUEUE_LEN;
 
-		if (block->header.sender_id == GetCurrentProcessId())
-			return NULL;
+		if (block->header.sender_id == GetCurrentProcessId()) {
+			return GetBlock(pos);
+		}
 
 		return block;
 	}
@@ -211,6 +254,38 @@ public:
 		//cleanup any message blocks where read_count == num_listeners
 		//subtract total message block lengths out of len_end.a with a compare exchange all at once
 		//	-this would mean only one process can be in charge of running Cleanup, alternatively I would have to do it one block at a time
+		//	-maybe I should have cleanup_weak and cleanup_strong?
+
+		auto old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
+		uint len = old_len_end.a;
+		uint end = old_len_end.b;
+		uint start = (end - len) % MESSAGE_QUEUE_LEN;
+		uint l = listeners.load(std::memory_order::memory_order_relaxed);
+
+		//std::cout << "start == " << start << ", len == " << len << ", end == " << end << ", listeners == " << l << ", start is in range == " << _IsInRange(start, old_len_end) << "\n";
+
+		uint del_len = 0;
+		for (uint pos = start; _IsInRange(pos, old_len_end); ) {
+			MessageBlock* block = (MessageBlock*)(data + pos);
+			//ushort read_count = block->header.read_count._Storage._Value;//non atomic load, just read the value
+			ushort read_count = block->header.read_count.load(std::memory_order::memory_order_relaxed);
+			if (read_count < l)
+				break;
+			del_len += block->header.len;
+			pos = (pos + block->header.len) % MESSAGE_QUEUE_LEN;
+		}
+
+		if (del_len == 0) return;
+
+		auto new_len_end = old_len_end;
+		new_len_end.a -= del_len;
+
+		if (len_end.compare_exchange_weak(old_len_end, new_len_end)) {
+			//std::cout << "cleaned up " << del_len << " bytes\n";
+		}
+		else {
+			//std::cout << "failed to cleanup " << del_len << " bytes\n";
+		}
 	}
 
 	MessageQueueContainer EachMessage(uint& pos) {
@@ -255,6 +330,7 @@ public:
 			return;
 		mcursor = 0;
 		mb->header.read_count.fetch_add(1, std::memory_order::memory_order_relaxed);
+		//std::cout << GetCurrentProcessId() << " marked " << (*qcursor - mb->header.len) << " as read, reading "<<(*qcursor)<<" next\n";
 		mb = messagequeue->GetBlock(*qcursor);
 		if (mb == NULL) {
 			qcursor = NULL;
@@ -459,7 +535,9 @@ MessageQueue* CreateSharedMessageQueue(SharedMem &sm, std::string name) {
 	sprintf_s(buff, "%u", shared_mem_id);
 	name = name + "-" + buff;
 	void* d = sm.CreateSharedMemory(name, sizeof(MessageQueue));
-	return new (d) MessageQueue();
+	auto mq = new (d) MessageQueue();
+	mq->AddListener();
+	return mq;
 }
 
 MessageQueue* OpenSharedMessageQueue(SharedMem& sm, std::string name, uint shared_mem_id) {
@@ -467,16 +545,14 @@ MessageQueue* OpenSharedMessageQueue(SharedMem& sm, std::string name, uint share
 	sprintf_s(buff, "%u", shared_mem_id);
 	name = name + "-" + buff;
 	void* d = sm.OpenSharedMemory(name, sizeof(MessageQueue));
-	return (MessageQueue*)d;
+	auto mq = (MessageQueue*)d;
+	mq->AddListener();
+	return mq;
 }
 
 void run_lib_tests() {
 	auto map = ParseKeyValues("foo=bar\n#test comment\nsigma=nuts");
 	std::string smap = WriteKeyValues(map);
-	map = ParseKeyValues(smap);
-	assert(map.size() == 2);
-	assert(map["foo"] == "bar");
-	assert(map["sigma"] == "nuts");
 
 	std::atomic<Uint32Pair> t2;
 	assert(t2.is_lock_free());
@@ -489,18 +565,65 @@ void run_lib_tests() {
 	MessageBlock mb;
 	mb.header.sender_id = 0;//we can't receive a message that we sent
 	auto m = mb.reserve();
-	strcpy_s((char*)m.data, 1024, "foobar");
+	strcpy_s((char*)m.data, 1024, smap.c_str());
 	m.SetDataLen((ushort)strlen((char*)m.data)+1);
 	mb.push(m);
 
 	mq.SendMessageBlock(mb.header, mb.data);
 
 	uint cursor = 0;
-	auto& recv_mb = *mq.GetBlock(cursor);
-	cursor = 0;
-	m = recv_mb.get(cursor);
-	assert(strcmp((char*)m.data, "foobar") == 0);
-	std::cout << "got: " << (char*)m.data << "\n";
+	for (auto m : mq.EachMessage(cursor)) {
+		std::cout << "got: " << (char*)m.data << "\n";
+
+		smap = (char*)m.data;
+		map = ParseKeyValues(smap);
+		assert(map.size() == 2);
+		assert(map["foo"] == "bar");
+		assert(map["sigma"] == "nuts");
+	}
+	assert(cursor > 0);
+
+	std::cout << "\n\ntest regression for issue #16\n";
+	MessageBlock mb2;
+	m = mb2.reserve();
+	strcpy_s((char*)m.data, 1024, smap.c_str());
+	m.SetDataLen((ushort)strlen((char*)m.data) + 1);
+	mb2.push(m);
+
+	mq.SendMessageBlock(mb2.header, mb2.data);
+
+	mq.Cleanup();//we are the only listener, so our sent message will get cleaned up
+
+	mq.SendMessageBlock(mb.header, mb.data);//resend the message from sender_id 0, we want to read this	
+	int issue_16_check = 0;
+	for (auto m : mq.EachMessage(cursor)) {
+		issue_16_check++;
+		std::cout << "got: " << (char*)m.data << "\n";
+
+		smap = (char*)m.data;
+		map = ParseKeyValues(smap);
+		assert(map.size() == 2);
+		assert(map["foo"] == "bar");
+		assert(map["sigma"] == "nuts");
+	}
+	assert(issue_16_check == 1);
+
+	std::cout << "\n\ntest to ensure the queue wraps properly...\n";
+	for (int i = 0; i < MESSAGE_QUEUE_LEN; i++) {//yea we're doing way more than 1 loop of the queue
+		mq.SendMessageBlock(mb.header, mb.data);//resend the message from sender_id 0, we want to read this
+
+		int loop_test = 0;
+		for (auto m : mq.EachMessage(cursor)) {
+			loop_test++;
+			smap = (char*)m.data;
+			map = ParseKeyValues(smap);
+			assert(map.size() == 2);
+			assert(map["foo"] == "bar");
+			assert(map["sigma"] == "nuts");
+		}
+		assert(loop_test == 1);
+		mq.Cleanup();
+	}
 
 	std::cout << "\ntests completed\n\n";
 }
