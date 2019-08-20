@@ -1,26 +1,16 @@
-#include <iostream>
-#include <Windows.h>
-#include <tchar.h>
-#include <string>
 
 #include "../AsyncGameEngine/AsyncGame.h"
 
-bool Proc(MessageQueue& mq) {
-	static uint cursor = mq.GetStart();
-	MessageBlock mb;
+bool HandleMessage(Message& m, MessageBlock& mb) {
+	auto m2 = mb.reserve();
+	strcpy_s((char*)m2.data, 1024, "foobar");
+	m2.SetDataLen((ushort)strlen((char*)m2.data) + 1);
+	mb.push(m2);
+	return true;
+}
 
-	for(auto recvm : mq.EachMessage(cursor)) {
-		for (int i = 0; i < 10 && mb.header.len < 10000; i++) {
-			auto m = mb.reserve();
-			strcpy_s((char*)m.data, 1024, "foobar");
-			m.SetDataLen((ushort)strlen((char*)m.data) + 1);
-			mb.push(m);
-		}
-		//don't send from inside the loop, because the message hasn't been marked as read yet, I need a better abstraction for this
-	}
-
-	if(mb.header.len > sizeof(mb.header))
-		mq.SendMessageBlock(mb.header, mb.data);
+bool Update(MessageBlock& mb) {
+	Sleep(1);
 	return true;
 }
 
@@ -34,9 +24,7 @@ int main(int argc, char* argv[])
 	SharedMem sm;
 	MessageQueue& mq = *OpenSharedMessageQueue(sm, "asynctest", shared_mem_id);
 	Sleep(2000);
-	while (Proc(mq)) {
-		Sleep(1);
-	}
+	mq.MessageLoop();
 
 	Sleep(1000);
 }

@@ -1,5 +1,13 @@
 #pragma once
 
+#include <stdio.h>
+#include <tchar.h>
+#include <string>
+#include <time.h>
+#include <system_error>
+#include <cassert>
+#include <assert.h>
+#include <iostream>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -10,12 +18,18 @@
 #include <string>
 #include <unordered_map>
 
+#include <Windows.h>
+
 typedef unsigned __int64 uint64;
 typedef unsigned int uint;
 typedef unsigned short ushort;
 const uint MESSAGE_QUEUE_LEN = 64 * 1024;//we'll need to handle this being set by the caller, for compatibility with different versions
 const uint MAX_MESSAGEBLOCK_SIZE = USHRT_MAX/2;//we use a ushort for the length variable, we could set this lower if we wanted, I just don't see a reason to
 
+class Message;
+class MessageBlock;
+bool HandleMessage(Message& m, MessageBlock& mb);
+bool Update(MessageBlock& mb);
 
 struct alignas(8) Uint32Pair {
 	uint a;
@@ -141,7 +155,7 @@ class MessageQueue {
 
 		while (old_len_end.a + len >= MESSAGE_QUEUE_LEN) {
 			std::cout << "message queue is full!\n";
-			Sleep(100);//make sure to reduce or remove this sleep timer for production code or a game
+			//Sleep(100);//make sure to reduce or remove this sleep timer for production code or a game
 			Cleanup();
 			old_len_end = len_end.load(std::memory_order::memory_order_relaxed);
 		}
@@ -277,7 +291,8 @@ public:
 		new_len_end.a -= del_len;
 
 		if (len_end.compare_exchange_weak(old_len_end, new_len_end)) {
-			//std::cout << "cleaned up " << del_len << " bytes\n";
+			std::cout << "cleaned up " << del_len << " bytes, new len == "<< new_len_end.a <<"\n";
+			//might want to track the new len for stats
 		}
 		else {
 			//std::cout << "failed to cleanup " << del_len << " bytes\n";
@@ -287,6 +302,8 @@ public:
 	MessageQueueContainer EachMessage(uint& pos) {
 		return MessageQueueContainer(this, pos);
 	}
+
+	void MessageLoop();
 };
 
 class MessageQueueIterator {
@@ -349,6 +366,23 @@ MessageQueueIterator MessageQueueContainer::begin() {
 
 MessageQueueIterator MessageQueueContainer::end() {
 	return MessageQueueIterator(NULL, NULL);
+}
+
+void MessageQueue::MessageLoop() {
+	uint cursor = GetStart();
+
+	while (1) {
+		MessageBlock mb;
+		for (auto recvm : EachMessage(cursor)) {
+			if (!HandleMessage(recvm, mb)) return;
+		}
+
+		if (!Update(mb)) return;
+
+		if (mb.header.len > sizeof(mb.header)) {
+			SendMessageBlock(mb.header, mb.data);
+		}
+	}
 }
 
 class SharedMem {
@@ -484,10 +518,6 @@ public:
 	}
 };
 
-class LocalModule : public Module {
-	//hold data like where we are in the message queue, event listeners and callbacks? performance stats?
-};
-
 void _ParseKeyValue(const char*& c, std::unordered_map<std::string, std::string> &map) {
 	const char* eq = strchr(c, '=') + 1;
 	const char* newline = strchr(c, '\n');
@@ -506,12 +536,15 @@ std::unordered_map<std::string, std::string> ParseKeyValues(std::string text) {
 	std::unordered_map<std::string, std::string> map;
 	const char* c = text.c_str();
 	while (*c) {
+		if (c == NULL) break;
+		while (*c == '\n' || *c == '\r') c++;
+		if (*c == '\0') break;
+
 		if (*c != '#') {
 			_ParseKeyValue(c, map);
 		}
-		while (*c) {
-			c++;
-			if (c[-1] == '\n') break;
+		else {
+			while (*c != '\n' && *c != '\r') c++;
 		}
 	}
 	return map;
@@ -544,81 +577,4 @@ MessageQueue* OpenSharedMessageQueue(SharedMem& sm, std::string name, uint share
 	auto mq = (MessageQueue*)d;
 	mq->AddListener();
 	return mq;
-}
-
-void run_lib_tests() {
-	auto map = ParseKeyValues("foo=bar\n#test comment\nsigma=nuts");
-	std::string smap = WriteKeyValues(map);
-
-	std::atomic<Uint32Pair> t2;
-	assert(t2.is_lock_free());
-	assert(sizeof(Uint32Pair) == 8);
-	assert(sizeof(t2) == sizeof(Uint32Pair));
-
-	SharedMem sm;
-	MessageQueue& mq = *CreateSharedMessageQueue(sm, "foobar");
-
-	MessageBlock mb;
-	mb.header.sender_id = 0;//we can't receive a message that we sent
-	auto m = mb.reserve();
-	strcpy_s((char*)m.data, 1024, smap.c_str());
-	m.SetDataLen((ushort)strlen((char*)m.data)+1);
-	mb.push(m);
-
-	mq.SendMessageBlock(mb.header, mb.data);
-
-	uint cursor = 0;
-	for (auto m : mq.EachMessage(cursor)) {
-		std::cout << "got: " << (char*)m.data << "\n";
-
-		smap = (char*)m.data;
-		map = ParseKeyValues(smap);
-		assert(map.size() == 2);
-		assert(map["foo"] == "bar");
-		assert(map["sigma"] == "nuts");
-	}
-	assert(cursor > 0);
-
-	std::cout << "\n\ntest regression for issue #16\n";
-	MessageBlock mb2;
-	m = mb2.reserve();
-	strcpy_s((char*)m.data, 1024, smap.c_str());
-	m.SetDataLen((ushort)strlen((char*)m.data) + 1);
-	mb2.push(m);
-
-	mq.SendMessageBlock(mb2.header, mb2.data);
-
-	mq.Cleanup();//we are the only listener, so our sent message will get cleaned up
-
-	mq.SendMessageBlock(mb.header, mb.data);//resend the message from sender_id 0, we want to read this	
-	int issue_16_check = 0;
-	for (auto m : mq.EachMessage(cursor)) {
-		issue_16_check++;
-		std::cout << "got: " << (char*)m.data << "\n";
-
-		smap = (char*)m.data;
-		map = ParseKeyValues(smap);
-		assert(map.size() == 2);
-		assert(map["foo"] == "bar");
-		assert(map["sigma"] == "nuts");
-	}
-	assert(issue_16_check == 1);
-
-	std::cout << "\n\ntest to ensure the queue wraps properly...\n";
-	for (int i = 0; i < MESSAGE_QUEUE_LEN; i++) {//yea we're doing way more than 1 loop of the queue
-		mq.SendMessageBlock(mb.header, mb.data);//resend the message from sender_id 0, we want to read this
-		int loop_test = 0;
-		for (auto m : mq.EachMessage(cursor)) {
-			loop_test++;
-			smap = (char*)m.data;
-			map = ParseKeyValues(smap);
-			assert(map.size() == 2);
-			assert(map["foo"] == "bar");
-			assert(map["sigma"] == "nuts");
-		}
-		assert(loop_test == 1);
-		mq.Cleanup();
-	}
-
-	std::cout << "\ntests completed\n\n";
 }
